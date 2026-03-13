@@ -1,0 +1,54 @@
+# J.A.R.V.I.S. Configuration
+# Copy this file to config.yaml and fill in your API keys.
+# You can also set values via environment variables: JARVIS_<KEY_NAME>
+
+# --- LLM Provider ---
+# Choose "ollama" (local, default), "anthropic", or "openai"
+llm_provider: "ollama"
+
+# Ollama (local) - requires: ollama pull qwen3:0.6b
+ollama_base_url: "http://localhost:11434/v1"
+ollama_model: "qwen3:0.6b"
+
+# Cloud alternatives (set llm_provider above to use)
+anthropic_api_key: ""
+anthropic_model: "claude-sonnet-4-20250514"
+
+openai_api_key: ""
+openai_model: "gpt-4o"
+
+# --- Text-to-Speech ---
+# TTS tries tiers in order: piper -> chatterbox -> openai -> edge-tts -> macOS say
+# Piper runs locally via ONNX, sub-second generation, no API key needed.
+
+piper_enabled: true
+piper_voice: "en_GB-alan-medium"    # Voice model in assets/piper/
+
+# Chatterbox Turbo — local neural TTS with voice cloning (requires venv-tts with Python 3.12)
+chatterbox_enabled: false
+
+openai_tts_voice: "onyx"           # Deep, authoritative voice
+edge_tts_voice: "en-GB-RyanNeural" # British English male
+macos_tts_voice: "Daniel"          # Offline fallback
+
+# --- Audio ---
+sample_rate: 16000
+chunk_ms: 80
+
+# --- Wake Word ---
+wakeword_model: "hey_jarvis"
+wakeword_threshold: 0.5
+
+# --- Speech-to-Text ---
+# Model sizes: tiny, base, small, medium, large-v3
+# "small" with int8 is the best speed/accuracy tradeoff on Apple Silicon
+whisper_model: "small"
+whisper_compute_type: "int8"
+whisper_device: "cpu"
+
+# --- Safety ---
+confirmation_timeout_sec: 10.0
+
+# --- Logging ---
+log_level: "INFO"
+log_file: "~/.jarvis/jarvis.log"

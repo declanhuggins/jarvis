@@ -1,0 +1,42 @@
+# Secrets
+config.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+venv/
+venv-tts/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Logs
+*.log
+
+# Models (downloaded at runtime)
+*.tflite
+*.onnx
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
