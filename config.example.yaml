@@ -1,53 +1,66 @@
-# J.A.R.V.I.S. Configuration
-# Copy this file to config.yaml and fill in your API keys.
-# You can also set values via environment variables: JARVIS_<KEY_NAME>
+# Example Jarvis configuration.
+# Copy to config.yaml and adjust for your machine.
+# Any setting can also be overridden with JARVIS_<KEY>.
 
-# --- LLM Provider ---
-# Choose "ollama" (local, default), "anthropic", or "openai"
-llm_provider: "ollama"
-
-# Ollama (local) - requires: ollama pull qwen3:0.6b
+# --- LLM ---
+llm_provider: "ollama"              # ollama | openai | anthropic | openclaw
 ollama_base_url: "http://localhost:11434/v1"
 ollama_model: "qwen3:0.6b"
 
-# Cloud alternatives (set llm_provider above to use)
 anthropic_api_key: ""
 anthropic_model: "claude-sonnet-4-20250514"
 
 openai_api_key: ""
 openai_model: "gpt-4o"
 
-# --- Text-to-Speech ---
-# TTS tries tiers in order: piper -> chatterbox -> openai -> edge-tts -> macOS say
-# Piper runs locally via ONNX, sub-second generation, no API key needed.
+# OpenClaw uses its OpenAI-compatible endpoint.
+# The API key field can also be a 1Password reference like:
+#   op://Private/OpenClaw/credential
+openclaw_base_url: "http://127.0.0.1:18789/v1"
+openclaw_api_key: ""
+openclaw_model: "openclaw"
+openclaw_agent_id: "main"
 
-piper_enabled: true
-piper_voice: "en_GB-alan-medium"    # Voice model in assets/piper/
+llm_history_turns: 6
+llm_json_retry_count: 1
 
-# Chatterbox Turbo — local neural TTS with voice cloning (requires venv-tts with Python 3.12)
-chatterbox_enabled: false
+# --- TTS ---
+tts_provider: "piper"               # piper | chatterbox | openai | edge-tts | macos-say | auto
 
-openai_tts_voice: "onyx"           # Deep, authoritative voice
-edge_tts_voice: "en-GB-RyanNeural" # British English male
-macos_tts_voice: "Daniel"          # Offline fallback
+piper_voice: "en_GB-alan-medium"
+piper_length_scale: 1.0
+
+# Used only when tts_provider: "chatterbox"
+chatterbox_voice_reference: ""
+chatterbox_device: "cpu"
+
+openai_tts_voice: "onyx"
+edge_tts_voice: "en-GB-RyanNeural"
+macos_tts_voice: "Daniel"
 
 # --- Audio ---
 sample_rate: 16000
 chunk_ms: 80
 
-# --- Wake Word ---
+# --- Wake / listen ---
 wakeword_model: "hey_jarvis"
 wakeword_threshold: 0.5
+wake_acknowledgement_mode: "tone"   # tone | speech | none
+wake_acknowledgement: "Yes?"        # used only in speech mode
+wake_acknowledgement_sound: "Pop"   # used only in tone mode
+wake_acknowledgement_delay_ms: 120
+wake_barge_in_grace_ms: 400
 
-# --- Speech-to-Text ---
-# Model sizes: tiny, base, small, medium, large-v3
-# "small" with int8 is the best speed/accuracy tradeoff on Apple Silicon
-whisper_model: "small"
+# --- STT ---
+whisper_backend: "faster-whisper"   # faster-whisper | mlx-whisper
+whisper_model: "small"              # tiny | base | small | medium | turbo | large-v3 | large-v3-turbo
 whisper_compute_type: "int8"
 whisper_device: "cpu"
 
-# --- Safety ---
+# --- Safety / conversation ---
 confirmation_timeout_sec: 10.0
+followup_timeout_sec: 8.0
+followup_max_turns: 2
 
 # --- Logging ---
 log_level: "INFO"

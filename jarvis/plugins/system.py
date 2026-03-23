@@ -3,12 +3,28 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import subprocess
+from pathlib import Path
 
 from jarvis.config import JarvisConfig
 from jarvis.plugins.base import BasePlugin
 
 logger = logging.getLogger(__name__)
+
+
+def _find_executable(name: str) -> str | None:
+    """Find a Homebrew-installed CLI in shell and launchd environments."""
+    candidates = [
+        shutil.which(name),
+        f"/opt/homebrew/bin/{name}",
+        f"/usr/local/bin/{name}",
+        f"/usr/bin/{name}",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return str(candidate)
+    return None
 
 
 class SystemPlugin(BasePlugin):
@@ -110,43 +126,31 @@ class SystemPlugin(BasePlugin):
         return f"Volume set to {level}%"
 
     def set_brightness(self, level: int) -> str:
-        """Set screen brightness using osascript with System Events."""
+        """Set screen brightness using the `brightness` CLI."""
         level = max(0, min(100, int(level)))
         fraction = level / 100.0
         logger.info("Setting brightness to %d%% (%.2f)", level, fraction)
 
-        # Try using the brightness command first (if installed via brew)
-        try:
-            subprocess.run(
-                ["brightness", str(fraction)],
-                check=True,
-                capture_output=True,
-            )
-            return f"Brightness set to {level}%"
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            pass
-
-        # Fallback: use osascript with System Preferences scripting
-        # Note: this may require accessibility permissions
-        try:
-            script = f"""
-            tell application "System Events"
-                tell appearance preferences
-                    -- Brightness control via scripting is limited on modern macOS.
-                    -- This is a best-effort approach.
-                end tell
-            end tell
-            """
-            subprocess.run(
-                ["osascript", "-e", script],
-                check=True,
-                capture_output=True,
-            )
-            return f"Brightness set to {level}%"
-        except subprocess.CalledProcessError:
+        brightness_cli = _find_executable("brightness")
+        if brightness_cli is None:
             return (
-                f"Could not set brightness. Install 'brightness' via "
-                f"'brew install brightness' for reliable brightness control."
+                "Brightness control is unavailable because the `brightness` CLI "
+                "is not installed. Run `brew install brightness`."
+            )
+
+        try:
+            subprocess.run(
+                [brightness_cli, str(fraction)],
+                check=True,
+                capture_output=True,
+            )
+            return f"Brightness set to {level}%"
+        except subprocess.CalledProcessError as e:
+            error = (e.stderr or b"").decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
+            details = f": {error.strip()}" if error else ""
+            return (
+                "Could not set brightness with the `brightness` CLI"
+                f"{details}"
             )
 
     def lock_screen(self) -> str:

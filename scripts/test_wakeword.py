@@ -6,7 +6,7 @@ with live resource monitoring (CPU, memory, GPU/ANE).
 
 Usage:
     source venv/bin/activate
-    python scripts/test_wakeword.py              # full pipeline with Ollama + Piper TTS
+    python scripts/test_wakeword.py              # full pipeline using config.yaml + Piper TTS
     python scripts/test_wakeword.py --chatterbox # use Chatterbox Turbo TTS (requires venv-tts)
     python scripts/test_wakeword.py --say         # force macOS 'say' for TTS
     python scripts/test_wakeword.py --no-llm      # skip LLM, echo transcript only
@@ -17,8 +17,11 @@ Press 'q' to quit.
 
 from __future__ import annotations
 
+import contextlib
 import curses
+import io
 import json
+import math
 import os
 import queue
 import subprocess
@@ -43,6 +46,10 @@ _PIPER_VOICE = "en_GB-alan-medium"
 _TTS_VENV_PYTHON = _PROJECT_DIR / "venv-tts" / "bin" / "python"
 _TTS_WORKER_SCRIPT = _SCRIPT_DIR / "tts_worker.py"
 _VOICE_REF = _PROJECT_DIR / "assets" / "voice_reference.wav"
+_CONFIG_PATH = _PROJECT_DIR / "config.yaml"
+
+if str(_PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_DIR))
 
 # ---------------------------------------------------------------------------
 # Shared state
@@ -78,6 +85,99 @@ def log(state: AppState, msg: str):
     state.log_lines.append(f"[{ts}] {msg}")
     if len(state.log_lines) > 200:
         state.log_lines = state.log_lines[-200:]
+
+
+@contextlib.contextmanager
+def _suppress_output():
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        yield
+
+
+def _resolve_chatterbox_voice_reference(config) -> Path | None:
+    raw = getattr(config, "chatterbox_voice_reference", "").strip()
+    if not raw:
+        return None
+
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = _PROJECT_DIR / path
+    return path
+
+
+def _resolve_chatterbox_device(config) -> str:
+    device = getattr(config, "chatterbox_device", "cpu").strip().lower()
+    if device not in {"cpu", "mps"}:
+        return "cpu"
+    return device
+
+
+def _capture_post_wake_audio(
+    audio_queue: queue.Queue[np.ndarray],
+    sample_rate: int,
+    chunk_samples: int,
+    grace_ms: int,
+    silence_threshold: float,
+) -> tuple[list[np.ndarray], bool]:
+    """Capture a short post-wake window to detect continuous speech."""
+    if grace_ms <= 0:
+        return [], False
+
+    chunk_ms = (chunk_samples / sample_rate) * 1000.0
+    grace_chunks = max(1, math.ceil(grace_ms / chunk_ms))
+    frames: list[np.ndarray] = []
+
+    for _ in range(grace_chunks):
+        try:
+            chunk = audio_queue.get(timeout=0.25).flatten()
+        except queue.Empty:
+            break
+        frames.append(chunk)
+        energy = np.abs(chunk.astype(np.float32)).mean()
+        if energy >= silence_threshold:
+            return frames, True
+
+    return frames, False
+
+
+def _emit_wake_acknowledgement(state: AppState, config, speak) -> None:
+    """Play the configured wake acknowledgement cue."""
+    mode = (getattr(config, "wake_acknowledgement_mode", "tone") or "tone").strip().lower()
+    if mode == "none":
+        return
+    if mode == "speech":
+        acknowledgement = (getattr(config, "wake_acknowledgement", "Yes?") or "").strip()
+        if acknowledgement:
+            speak(acknowledgement)
+        return
+    if mode == "tone":
+        sound_name = (getattr(config, "wake_acknowledgement_sound", "Pop") or "Pop").strip() or "Pop"
+        sound_path = Path("/System/Library/Sounds") / f"{sound_name}.aiff"
+        if sound_path.exists():
+            subprocess.Popen(
+                ["afplay", str(sound_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            log(state, f"Wake tone: {sound_name}")
+
+
+def _discard_audio_window(
+    audio_queue: queue.Queue[np.ndarray],
+    sample_rate: int,
+    chunk_samples: int,
+    duration_ms: int,
+) -> None:
+    """Read and discard a short microphone window."""
+    if duration_ms <= 0:
+        return
+
+    chunk_ms = (chunk_samples / sample_rate) * 1000.0
+    discard_chunks = max(1, math.ceil(duration_ms / chunk_ms))
+    for _ in range(discard_chunks):
+        try:
+            audio_queue.get(timeout=0.25)
+        except queue.Empty:
+            break
 
 
 # ---------------------------------------------------------------------------
@@ -164,15 +264,16 @@ class ChatterboxTTSClient:
     def __init__(self):
         self._proc: subprocess.Popen | None = None
 
-    def start(self, state: AppState) -> bool:
+    def start(self, state: AppState, voice_ref: Path | None = None, device: str = "cpu") -> bool:
         if not _TTS_VENV_PYTHON.exists():
             log(state, f"venv-tts not found: {_TTS_VENV_PYTHON}")
             return False
         try:
             log(state, "Starting Chatterbox Turbo worker...")
             env = dict(os.environ)
-            if _VOICE_REF.exists():
-                env["CHATTERBOX_VOICE_REF"] = str(_VOICE_REF)
+            if voice_ref is not None:
+                env["CHATTERBOX_VOICE_REF"] = str(voice_ref)
+            env["CHATTERBOX_DEVICE"] = device
             self._proc = subprocess.Popen(
                 [str(_TTS_VENV_PYTHON), str(_TTS_WORKER_SCRIPT), "--serve"],
                 stdin=subprocess.PIPE,
@@ -192,7 +293,8 @@ class ChatterboxTTSClient:
                 log(state, f"Chatterbox unexpected startup: {msg}")
                 return False
             log(state, f"Chatterbox Turbo ready (device={msg.get('device', '?')}, "
-                       f"loaded in {msg.get('load_time', '?')}s)")
+                       f"loaded in {msg.get('load_time', '?')}s, "
+                       f"voice_clone={'on' if msg.get('voice_clone') else 'off'})")
             return True
         except Exception as e:
             log(state, f"Chatterbox start failed: {e}")
@@ -242,77 +344,65 @@ class ChatterboxTTSClient:
 # LLM client
 # ---------------------------------------------------------------------------
 
-class OllamaLLMClient:
-    """Lightweight Ollama LLM client for the test harness."""
+class SharedLLMClient:
+    """Adapter over the main Jarvis LLM client used by the test harness."""
 
-    def __init__(self, base_url: str = "http://localhost:11434", model: str = "qwen3:0.6b"):
-        self._model = model
-        self._base_url = base_url.rstrip("/").replace("/v1", "")
-        self._connected = False
+    def __init__(self, config):
+        from jarvis.llm import LLMClient
+        from jarvis.intent import parse_intent
+        from jarvis.main import _build_response_text
+        from jarvis.plugins import register_all_plugins
+        from jarvis.router import CommandRouter
+
+        self._config = config
+        self._client = LLMClient(self._config)
+        self._build_response_text = _build_response_text
+        self._parse_intent = parse_intent
+        self._router = CommandRouter()
+        register_all_plugins(self._router, self._config)
+        self._catalog = self._router.get_action_catalog()
 
     def connect(self, state: AppState) -> bool:
         try:
-            import httpx
-            resp = httpx.get(f"{self._base_url}/api/tags", timeout=5.0)
-            resp.raise_for_status()
-            self._connected = True
-            log(state, f"Ollama connected (model={self._model})")
+            provider = self._config.llm_provider
+            model = getattr(self._config, f"{provider}_model", "?")
+            state.llm_engine = f"{provider}/{model}"
+            if provider == "openclaw":
+                log(
+                    state,
+                    "LLM configured: "
+                    f"{provider} (model={model}, base_url={self._config.openclaw_base_url})",
+                )
+            else:
+                log(state, f"LLM configured: {provider} (model={model})")
             return True
         except Exception as e:
-            log(state, f"Ollama connection failed: {e}")
+            log(state, f"LLM setup failed: {e}")
             return False
 
     def get_response(self, transcript: str, state: AppState) -> str:
-        """Send transcript to Ollama, return spoken_response text."""
-        if not self._connected:
-            return f"You said: {transcript}"
-
-        system_prompt = (
-            "You are Jarvis, a personal AI assistant. The user gave a voice command. "
-            "Respond with a single JSON object: "
-            '{"action": "conversational_response", "spoken_response": "your reply here"}. '
-            "Keep spoken_response under 2 sentences. No markdown."
-        )
-
+        """Send transcript through the shared Jarvis LLM client and execute safe actions."""
         try:
-            import httpx
             t0 = time.monotonic()
-            payload = {
-                "model": self._model,
-                "stream": False,
-                "think": False,
-                "format": "json",
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": transcript},
-                ],
-            }
-            resp = httpx.post(
-                f"{self._base_url}/api/chat",
-                json=payload,
-                timeout=120.0,
-            )
-            resp.raise_for_status()
+            data = self._client.get_intent(transcript, self._catalog)
             state.last_llm_time = time.monotonic() - t0
-            raw = resp.json()["message"]["content"]
+            intent = self._parse_intent(data)
+            state.last_intent = intent.action
 
-            # Strip code fences
-            cleaned = raw.strip()
-            if cleaned.startswith("```"):
-                lines = cleaned.splitlines()
-                lines = [l for l in lines if not l.strip().startswith("```")]
-                cleaned = "\n".join(lines).strip()
+            response = intent.spoken_response
+            result = ""
+            if intent.confirmation_required:
+                log(state, "Harness does not auto-confirm destructive actions")
+            else:
+                result = self._router.execute(intent)
+                if result:
+                    log(state, f"Action result: {result}")
 
-            try:
-                data = json.loads(cleaned)
-                state.last_intent = data.get("action", "?")
-                spoken = data.get("spoken_response", raw)
-                log(state, f"LLM ({state.last_llm_time:.1f}s): {spoken}")
-                return spoken
-            except json.JSONDecodeError:
-                state.last_intent = "raw_text"
-                log(state, f"LLM ({state.last_llm_time:.1f}s): {raw[:120]}")
-                return raw
+            response = self._build_response_text(intent.action, response, result)
+
+            self._client.record_turn(transcript, data, response, result)
+            log(state, f"LLM ({state.last_llm_time:.1f}s): {intent.spoken_response}")
+            return response
         except Exception as e:
             log(state, f"LLM error: {e}")
             state.last_intent = "error"
@@ -438,7 +528,13 @@ def draw_tui(stdscr, state: AppState):
 # Pipeline thread
 # ---------------------------------------------------------------------------
 
-def pipeline_thread(state: AppState, force_say: bool, use_chatterbox: bool, no_llm: bool, whisper_model: str):
+def pipeline_thread(
+    state: AppState,
+    force_say: bool,
+    use_chatterbox: bool,
+    no_llm: bool,
+    whisper_model_override: str | None,
+):
     """Run wake word -> STT -> LLM -> TTS pipeline."""
     try:
         import sounddevice as sd
@@ -456,9 +552,7 @@ def pipeline_thread(state: AppState, force_say: bool, use_chatterbox: bool, no_l
     try:
         from faster_whisper import WhisperModel
     except ImportError:
-        log(state, "ERROR: pip install faster-whisper")
-        state.running = False
-        return
+        WhisperModel = None
 
     SAMPLE_RATE = 16000
     CHUNK_SAMPLES = 1280
@@ -467,28 +561,52 @@ def pipeline_thread(state: AppState, force_say: bool, use_chatterbox: bool, no_l
     SILENCE_CHUNKS = 15
     MAX_RECORD_SEC = 15.0
 
+    # Load app config so the harness matches the main app's TTS settings.
+    from jarvis.config import load_config
+
+    config = load_config(_CONFIG_PATH)
+    chatterbox_voice_ref = _resolve_chatterbox_voice_reference(config)
+    chatterbox_device = _resolve_chatterbox_device(config)
+    whisper_model = whisper_model_override or config.whisper_model
+    whisper_backend = (config.whisper_backend or "faster-whisper").strip()
+    whisper_device = (config.whisper_device or "cpu").strip().lower()
+    whisper_compute_type = (config.whisper_compute_type or "int8").strip()
+    wake_barge_in_grace_ms = int(getattr(config, "wake_barge_in_grace_ms", 400))
+    wake_ack_mode = (getattr(config, "wake_acknowledgement_mode", "tone") or "tone").strip().lower()
+    wake_ack_delay_ms = int(getattr(config, "wake_acknowledgement_delay_ms", 120))
+
     # --- TTS ---
+    selected_tts_provider = (getattr(config, "tts_provider", "piper") or "piper").strip().lower()
+    if use_chatterbox:
+        selected_tts_provider = "chatterbox"
+    elif force_say:
+        selected_tts_provider = "macos-say"
+
     tts_client = None
-    if not force_say:
-        if use_chatterbox:
-            tts_client = ChatterboxTTSClient()
-            if tts_client.start(state):
-                state.tts_engine = "Chatterbox Turbo"
-            else:
-                log(state, "Chatterbox failed, falling back to Piper")
-                tts_client = PiperTTSClient()
-                if not tts_client.start(state):
-                    log(state, "Falling back to macOS 'say'")
-                    tts_client = None
-                else:
-                    state.tts_engine = "Piper"
+    if selected_tts_provider == "chatterbox":
+        tts_client = ChatterboxTTSClient()
+        if chatterbox_voice_ref is not None and chatterbox_voice_ref.exists():
+            log(state, f"Chatterbox custom voice enabled: {chatterbox_voice_ref}")
+        log(state, f"Chatterbox device requested: {chatterbox_device}")
+        if tts_client.start(
+            state,
+            voice_ref=chatterbox_voice_ref if chatterbox_voice_ref and chatterbox_voice_ref.exists() else None,
+            device=chatterbox_device,
+        ):
+            state.tts_engine = "Chatterbox Turbo"
         else:
-            tts_client = PiperTTSClient()
-            if tts_client.start(state):
-                state.tts_engine = "Piper"
-            else:
-                log(state, "Falling back to macOS 'say'")
-                tts_client = None
+            log(state, "Chatterbox failed, falling back to macOS 'say'")
+            tts_client = None
+    elif selected_tts_provider == "piper":
+        tts_client = PiperTTSClient()
+        if tts_client.start(state):
+            state.tts_engine = "Piper"
+        else:
+            log(state, "Piper failed, falling back to macOS 'say'")
+            tts_client = None
+    else:
+        tts_client = None
+
     if tts_client is None:
         state.tts_engine = "macOS say"
 
@@ -500,10 +618,14 @@ def pipeline_thread(state: AppState, force_say: bool, use_chatterbox: bool, no_l
     # --- LLM ---
     llm_client = None
     if not no_llm:
-        state.phase = "Connecting to Ollama..."
-        llm_client = OllamaLLMClient()
-        if llm_client.connect(state):
-            state.llm_engine = "Ollama/qwen3:0.6b"
+        state.phase = f"Loading config: {_CONFIG_PATH.name}..."
+        try:
+            llm_client = SharedLLMClient(config)
+        except Exception as e:
+            log(state, f"LLM setup failed: {e}")
+            llm_client = None
+        if llm_client and llm_client.connect(state):
+            state.phase = "LLM ready"
         else:
             log(state, "LLM unavailable — will echo transcripts")
             llm_client = None
@@ -522,9 +644,57 @@ def pipeline_thread(state: AppState, force_say: bool, use_chatterbox: bool, no_l
     log(state, "Loading wake word model: hey_jarvis")
     oww = WakeWordModel(wakeword_models=["hey_jarvis"], inference_framework="onnx")
 
-    state.phase = f"Loading Whisper: {whisper_model}..."
-    log(state, f"Loading Whisper model: {whisper_model} (int8, cpu)")
-    whisper = WhisperModel(whisper_model, device="cpu", compute_type="int8")
+    if whisper_backend == "mlx-whisper":
+        try:
+            import mlx.core as mx
+            import mlx_whisper
+            from mlx_whisper.transcribe import ModelHolder
+        except ImportError:
+            log(state, "ERROR: pip install mlx-whisper")
+            state.running = False
+            return
+        whisper = None
+        if whisper_device != "cpu":
+            log(state, f"Whisper backend {whisper_backend} ignores whisper_device={whisper_device!r}")
+        whisper_repo = whisper_model
+        if "/" not in whisper_model:
+            whisper_repo = {
+                "tiny": "mlx-community/whisper-tiny",
+                "base": "mlx-community/whisper-base",
+                "small": "mlx-community/whisper-small",
+                "medium": "mlx-community/whisper-medium",
+                "turbo": "mlx-community/whisper-turbo",
+                "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
+                "large-v3": "mlx-community/whisper-large-v3",
+            }.get(whisper_model, whisper_model)
+        log(state, f"Loading Whisper model: {whisper_model} (backend={whisper_backend}, repo={whisper_repo})")
+        with _suppress_output():
+            ModelHolder.get_model(whisper_repo, mx.float16)
+            # Warm once so the first real utterance does not pay MLX compile cost.
+            t = np.linspace(0.0, 1.0, SAMPLE_RATE, endpoint=False, dtype=np.float32)
+            warm_audio = 0.02 * np.sin(2 * np.pi * 220 * t).astype(np.float32)
+            mlx_whisper.transcribe(
+                warm_audio,
+                path_or_hf_repo=whisper_repo,
+                verbose=None,
+                language="en",
+                condition_on_previous_text=False,
+            )
+    else:
+        if WhisperModel is None:
+            log(state, "ERROR: pip install faster-whisper")
+            state.running = False
+            return
+        if whisper_device == "mps":
+            log(state, "Whisper device 'mps' is unsupported by faster-whisper here; falling back to cpu")
+            whisper_device = "cpu"
+
+        log(state, f"Loading Whisper model: {whisper_model} (backend={whisper_backend}, {whisper_compute_type}, {whisper_device})")
+        whisper = WhisperModel(
+            whisper_model,
+            device=whisper_device,
+            compute_type=whisper_compute_type,
+        )
     log(state, "All models loaded")
 
     # --- Audio stream ---
@@ -567,19 +737,47 @@ def pipeline_thread(state: AppState, force_say: bool, use_chatterbox: bool, no_l
             state.phase = "Wake word detected!"
             state.total_commands += 1
             log(state, f"Wake word detected (score={score:.3f})")
+            frames_list, continued_speech = _capture_post_wake_audio(
+                audio_queue,
+                sample_rate=SAMPLE_RATE,
+                chunk_samples=CHUNK_SAMPLES,
+                grace_ms=wake_barge_in_grace_ms,
+                silence_threshold=SILENCE_THRESHOLD,
+            )
 
-            state.phase = "Acknowledging..."
-            speak("Yes?")
-            drain()
+            if continued_speech:
+                state.phase = "Recording..."
+                log(state, "Skipping wake acknowledgement; user kept speaking")
+            else:
+                frames_list = []
+                if wake_ack_mode != "none":
+                    state.phase = "Acknowledging..."
+                    _emit_wake_acknowledgement(state, config, speak)
+                    if wake_ack_mode == "speech":
+                        drain()
+                    elif wake_ack_mode == "tone":
+                        _discard_audio_window(
+                            audio_queue,
+                            sample_rate=SAMPLE_RATE,
+                            chunk_samples=CHUNK_SAMPLES,
+                            duration_ms=wake_ack_delay_ms,
+                        )
 
             # ── Record ──
             state.phase = "Recording... (speak now)"
-            frames_list: list[np.ndarray] = []
             consecutive_silent = 0
             has_speech = False
+            for existing in frames_list:
+                energy = np.abs(existing.astype(np.float32)).mean()
+                if energy < SILENCE_THRESHOLD:
+                    consecutive_silent += 1
+                else:
+                    consecutive_silent = 0
+                    has_speech = True
             max_chunks = int(MAX_RECORD_SEC * SAMPLE_RATE / CHUNK_SAMPLES)
+            remaining_chunks = max(0, max_chunks - len(frames_list))
 
-            for _ in range(max_chunks):
+            for _ in range(remaining_chunks):
                 if not state.running:
                     break
                 try:
@@ -609,11 +807,22 @@ def pipeline_thread(state: AppState, force_say: bool, use_chatterbox: bool, no_l
             duration = len(audio_float) / SAMPLE_RATE
 
             t0 = time.monotonic()
-            segments, info = whisper.transcribe(
-                audio_float, language="en", beam_size=1,
-                vad_filter=True, condition_on_previous_text=False,
-            )
-            text = " ".join(seg.text for seg in segments).strip()
+            if whisper_backend == "mlx-whisper":
+                with _suppress_output():
+                    result = mlx_whisper.transcribe(
+                        audio_float,
+                        path_or_hf_repo=whisper_repo,
+                        verbose=None,
+                        language="en",
+                        condition_on_previous_text=False,
+                    )
+                text = result["text"].strip()
+            else:
+                segments, info = whisper.transcribe(
+                    audio_float, language="en", beam_size=1,
+                    vad_filter=True, condition_on_previous_text=False,
+                )
+                text = " ".join(seg.text for seg in segments).strip()
             state.last_stt_time = time.monotonic() - t0
             state.last_transcript = text
             log(state, f'Transcript ({state.last_stt_time:.2f}s): "{text}"')
@@ -666,7 +875,7 @@ def curses_main(stdscr):
     force_say = "--say" in sys.argv
     use_chatterbox = "--chatterbox" in sys.argv
     no_llm = "--no-llm" in sys.argv
-    whisper_model = "small"
+    whisper_model = None
     for arg in sys.argv[1:]:
         if arg.startswith("--model="):
             whisper_model = arg.split("=", 1)[1]

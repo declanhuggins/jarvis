@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "jarvis"
@@ -10,6 +10,7 @@ requires-python = ">=3.11"
 dependencies = [
     "openwakeword>=0.6.0",
     "faster-whisper>=1.0.0",
+    "mlx-whisper>=0.4.3; platform_system == 'Darwin' and platform_machine == 'arm64'",
     "sounddevice>=0.4.6",
     "numpy>=1.24",
     "anthropic>=0.25.0",
@@ -18,6 +19,7 @@ dependencies = [
     "pyyaml>=6.0",
     "piper-tts>=1.4.0",
     "psutil>=5.9",
+    "pynput>=1.7.7",
 ]
 
 [project.optional-dependencies]
@@ -28,3 +30,6 @@ dev = [
 
 [project.scripts]
 jarvis = "jarvis.main:run"
+
+[tool.setuptools.packages.find]
+include = ["jarvis*"]

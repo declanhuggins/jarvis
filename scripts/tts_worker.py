@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 import time
+from pathlib import Path
 
 
 def _suppress_stdout():
@@ -42,19 +44,49 @@ def _load_model():
         import torch
         from chatterbox.tts_turbo import ChatterboxTurboTTS
 
-        # Force CPU — MPS causes a memory pressure spiral when Ollama
-        # also uses the GPU, leading to TTS times ballooning from 3s
-        # to 50s+.  Turbo is small (350M params) and runs fine on CPU.
-        device = "cpu"
+        device = os.environ.get("CHATTERBOX_DEVICE", "cpu").strip().lower() or "cpu"
+        if device not in {"cpu", "mps"}:
+            device = "cpu"
         t0 = time.monotonic()
         model = ChatterboxTurboTTS.from_pretrained(device=device)
         elapsed = time.monotonic() - t0
     finally:
         sys.stdout = real_stdout
 
-    print(json.dumps({"status": "ready", "device": device, "load_time": round(elapsed, 1)}),
-          flush=True)
+    voice_ref = _resolve_voice_ref(os.environ.get("CHATTERBOX_VOICE_REF", ""))
+    voice_clone = False
+    if voice_ref is not None:
+        real_stdout = _suppress_stdout()
+        try:
+            model.prepare_conditionals(str(voice_ref))
+            setattr(model, "_jarvis_cached_voice_ref", str(voice_ref))
+            voice_clone = True
+        finally:
+            sys.stdout = real_stdout
+
+    print(
+        json.dumps(
+            {
+                "status": "ready",
+                "device": device,
+                "load_time": round(elapsed, 1),
+                "voice_clone": voice_clone,
+            }
+        ),
+        flush=True,
+    )
     return model
+
+
+def _resolve_voice_ref(raw_path: str) -> Path | None:
+    raw_path = raw_path.strip()
+    if not raw_path:
+        return None
+
+    path = Path(raw_path).expanduser()
+    if not path.exists():
+        return None
+    return path.resolve()
 
 
 def _generate(model, text: str, output_path: str, voice_ref: str | None = None) -> dict:
@@ -66,7 +98,9 @@ def _generate(model, text: str, output_path: str, voice_ref: str | None = None) 
     try:
         t0 = time.monotonic()
         kwargs = {}
-        if voice_ref:
+        resolved_voice_ref = _resolve_voice_ref(voice_ref or "")
+        cached_voice_ref = getattr(model, "_jarvis_cached_voice_ref", None)
+        if resolved_voice_ref is not None and str(resolved_voice_ref) != cached_voice_ref:
             kwargs["audio_prompt_path"] = voice_ref
         wav = model.generate(text, **kwargs)
         gen_time = time.monotonic() - t0
@@ -86,8 +120,6 @@ def serve():
 
     model = _load_model()
 
-    # Check for a default voice reference from env
-    import os
     default_voice_ref = os.environ.get("CHATTERBOX_VOICE_REF", "")
 
     for line in sys.stdin:
@@ -132,7 +164,7 @@ def oneshot(output_path: str, text: str) -> int:
         t0 = time.monotonic()
         kwargs = {}
         voice_ref = os.environ.get("CHATTERBOX_VOICE_REF", "")
-        if voice_ref:
+        if _resolve_voice_ref(voice_ref) is not None:
             kwargs["audio_prompt_path"] = voice_ref
         wav = model.generate(text, **kwargs)
         gen_time = time.monotonic() - t0

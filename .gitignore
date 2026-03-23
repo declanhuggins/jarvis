@@ -40,3 +40,7 @@ env/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Assets
+.assets/
+assets/piper/

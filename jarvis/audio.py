@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import threading
 
 import numpy as np
 import sounddevice as sd
@@ -21,6 +22,8 @@ class AudioStream:
         self._chunk_samples = chunk_samples
         self._queue: queue.Queue[np.ndarray] = queue.Queue()
         self._stream: sd.InputStream | None = None
+        self._muted = False
+        self._state_lock = threading.Lock()
 
     def _callback(
         self,
@@ -35,6 +38,9 @@ class AudioStream:
         """
         if status:
             logger.debug("Audio callback status: %s", status)
+        with self._state_lock:
+            if self._muted:
+                return
         self._queue.put_nowait(indata.copy())
 
     def start(self) -> None:
@@ -92,6 +98,33 @@ class AudioStream:
                 break
         if discarded:
             logger.debug("Drained %d audio chunks", discarded)
+
+    def set_muted(self, muted: bool) -> None:
+        """Enable or disable microphone capture for Jarvis."""
+        with self._state_lock:
+            self._muted = muted
+        if muted:
+            self.drain()
+            logger.info("Audio stream muted")
+        else:
+            logger.info("Audio stream unmuted")
+
+    def toggle_muted(self) -> bool:
+        """Toggle muted state and return the new value."""
+        with self._state_lock:
+            self._muted = not self._muted
+            muted = self._muted
+        if muted:
+            self.drain()
+            logger.info("Audio stream muted")
+        else:
+            logger.info("Audio stream unmuted")
+        return muted
+
+    @property
+    def muted(self) -> bool:
+        with self._state_lock:
+            return self._muted
 
     @property
     def sample_rate(self) -> int:

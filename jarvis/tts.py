@@ -1,7 +1,7 @@
 """Tiered text-to-speech engine.
 
-Tries providers in order: Piper -> Chatterbox Turbo -> OpenAI TTS -> edge-tts -> macOS say.
-Falls through to the next tier on failure.
+Uses a configured primary provider and falls through to lighter-weight backups
+on failure.
 """
 
 from __future__ import annotations
@@ -25,7 +25,43 @@ _PROJECT_DIR = Path(__file__).resolve().parent.parent
 _PIPER_VOICE_DIR = _PROJECT_DIR / "assets" / "piper"
 _TTS_VENV_PYTHON = _PROJECT_DIR / "venv-tts" / "bin" / "python"
 _TTS_WORKER_SCRIPT = _PROJECT_DIR / "scripts" / "tts_worker.py"
-_VOICE_REF = _PROJECT_DIR / "assets" / "voice_reference.wav"
+
+
+def _resolve_chatterbox_voice_reference(config: JarvisConfig) -> Path | None:
+    """Resolve the optional Chatterbox voice reference path."""
+    raw = (config.chatterbox_voice_reference or "").strip()
+    if not raw:
+        return None
+
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = _PROJECT_DIR / path
+    return path
+
+
+def _resolve_chatterbox_device(config: JarvisConfig) -> str:
+    """Resolve the Chatterbox device setting to a supported runtime value."""
+    device = (config.chatterbox_device or "cpu").strip().lower()
+    if device not in {"cpu", "mps"}:
+        logger.warning("Unknown chatterbox_device=%r, defaulting to 'cpu'", device)
+        return "cpu"
+    return device
+
+
+def _resolve_tts_provider_order(config: JarvisConfig) -> list[str]:
+    """Return the TTS provider order for this config."""
+    primary = (config.tts_provider or "piper").strip().lower()
+    if primary == "auto":
+        return ["piper", "chatterbox", "openai", "edge-tts", "macos-say"]
+
+    fallback_map = {
+        "piper": ["openai", "edge-tts", "macos-say"],
+        "chatterbox": ["openai", "edge-tts", "macos-say"],
+        "openai": ["edge-tts", "macos-say"],
+        "edge-tts": ["macos-say"],
+        "macos-say": [],
+    }
+    return [primary, *fallback_map[primary]]
 
 
 class _ChatterboxWorker:
@@ -38,11 +74,12 @@ class _ChatterboxWorker:
         self._proc: subprocess.Popen | None = None
         self._ready = False
 
-    def start(self) -> None:
+    def start(self, voice_ref: Path | None = None, device: str = "cpu") -> None:
         logger.info("Starting Chatterbox Turbo TTS worker...")
         env = dict(os.environ)
-        if _VOICE_REF.exists():
-            env["CHATTERBOX_VOICE_REF"] = str(_VOICE_REF)
+        if voice_ref is not None:
+            env["CHATTERBOX_VOICE_REF"] = str(voice_ref)
+        env["CHATTERBOX_DEVICE"] = device
         self._proc = subprocess.Popen(
             [str(_TTS_VENV_PYTHON), str(_TTS_WORKER_SCRIPT), "--serve"],
             stdin=subprocess.PIPE,
@@ -59,8 +96,12 @@ class _ChatterboxWorker:
         if msg.get("status") != "ready":
             self.stop()
             raise TTSError(f"Chatterbox worker unexpected startup: {msg}")
-        logger.info("Chatterbox Turbo ready (device=%s, loaded in %ss)",
-                     msg.get("device", "?"), msg.get("load_time", "?"))
+        logger.info(
+            "Chatterbox Turbo ready (device=%s, loaded in %ss, voice_clone=%s)",
+            msg.get("device", "?"),
+            msg.get("load_time", "?"),
+            "on" if msg.get("voice_clone") else "off",
+        )
         self._ready = True
 
     def generate(self, text: str, output_path: str) -> float:
@@ -106,29 +147,43 @@ class TTSEngine:
         self._chatterbox: _ChatterboxWorker | None = None
         self._tiers: list[tuple[str, callable]] = []
 
-        # Piper TTS — fast local neural TTS (~0.5s per utterance)
-        if config.piper_enabled:
-            try:
-                self._piper_voice = self._load_piper()
-                self._tiers.append(("Piper", self._speak_piper))
-            except Exception as e:
-                logger.warning("Failed to load Piper TTS: %s", e)
-
-        # Chatterbox Turbo — local neural TTS with voice cloning (requires venv-tts)
-        if config.chatterbox_enabled and _TTS_VENV_PYTHON.exists():
-            worker = _ChatterboxWorker()
-            try:
-                worker.start()
-                self._chatterbox = worker
-                self._tiers.append(("Chatterbox Turbo", self._speak_chatterbox))
-            except Exception as e:
-                logger.warning("Failed to start Chatterbox Turbo: %s", e)
-                worker.stop()
-
-        if config.openai_api_key:
-            self._tiers.append(("OpenAI TTS", self._speak_openai))
-        self._tiers.append(("edge-tts", self._speak_edge_tts))
-        self._tiers.append(("macOS say", self._speak_macos))
+        for provider in _resolve_tts_provider_order(config):
+            if provider == "piper":
+                try:
+                    self._piper_voice = self._load_piper()
+                    self._tiers.append(("Piper", self._speak_piper))
+                except Exception as e:
+                    logger.warning("Failed to load Piper TTS: %s", e)
+            elif provider == "chatterbox":
+                if not _TTS_VENV_PYTHON.exists():
+                    logger.warning("Chatterbox Turbo unavailable: %s not found", _TTS_VENV_PYTHON)
+                    continue
+                worker = _ChatterboxWorker()
+                try:
+                    voice_ref = _resolve_chatterbox_voice_reference(config)
+                    if voice_ref is not None:
+                        if voice_ref.exists():
+                            logger.info("Chatterbox Turbo voice cloning enabled: %s", voice_ref)
+                        else:
+                            logger.warning("Chatterbox voice reference not found: %s", voice_ref)
+                            voice_ref = None
+                    else:
+                        logger.info("Chatterbox Turbo using built-in voice")
+                    device = _resolve_chatterbox_device(config)
+                    logger.info("Chatterbox Turbo device requested: %s", device)
+                    worker.start(voice_ref=voice_ref, device=device)
+                    self._chatterbox = worker
+                    self._tiers.append(("Chatterbox Turbo", self._speak_chatterbox))
+                except Exception as e:
+                    logger.warning("Failed to start Chatterbox Turbo: %s", e)
+                    worker.stop()
+            elif provider == "openai":
+                if config.openai_api_key:
+                    self._tiers.append(("OpenAI TTS", self._speak_openai))
+            elif provider == "edge-tts":
+                self._tiers.append(("edge-tts", self._speak_edge_tts))
+            elif provider == "macos-say":
+                self._tiers.append(("macOS say", self._speak_macos))
 
         tier_names = [name for name, _ in self._tiers]
         logger.info("TTS tiers configured: %s", " -> ".join(tier_names))
@@ -136,6 +191,7 @@ class TTSEngine:
     def _load_piper(self):
         """Load the Piper voice model."""
         from piper import PiperVoice
+        from piper.config import SynthesisConfig
 
         model_path = _PIPER_VOICE_DIR / self._config.piper_voice
         onnx = model_path.with_suffix(".onnx")
@@ -146,6 +202,9 @@ class TTSEngine:
         voice = PiperVoice.load(str(onnx))
         elapsed = time.monotonic() - t0
         logger.info("Piper TTS loaded (%s) in %.1fs", self._config.piper_voice, elapsed)
+        self._piper_synthesis_config = SynthesisConfig(
+            length_scale=self._config.piper_length_scale,
+        )
         return voice
 
     def shutdown(self) -> None:
@@ -176,7 +235,11 @@ class TTSEngine:
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
             with wave.open(f.name, "wb") as wav:
-                self._piper_voice.synthesize_wav(text, wav)
+                self._piper_voice.synthesize_wav(
+                    text,
+                    wav,
+                    syn_config=self._piper_synthesis_config,
+                )
             subprocess.run(["afplay", f.name], check=True, timeout=60)
 
     def _speak_chatterbox(self, text: str) -> None:

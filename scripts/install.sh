@@ -42,12 +42,30 @@ openwakeword.utils.download_models()
 print('Wake word models downloaded.')
 "
 
-# 5. Download Whisper model (pre-cache)
-echo "[5/6] Pre-downloading Whisper model (this may take a minute)..."
+# 5. Download STT model (pre-cache)
+echo "[5/6] Pre-downloading STT model (this may take a minute)..."
 "$VENV_DIR/bin/python" -c "
-from faster_whisper import WhisperModel
-model = WhisperModel('small', device='cpu', compute_type='int8')
-print('Whisper small model ready.')
+from jarvis.config import load_config
+from jarvis.stt import _resolve_mlx_model_repo
+
+config = load_config('$PROJECT_DIR/config.yaml') if __import__('pathlib').Path('$PROJECT_DIR/config.yaml').exists() else load_config()
+
+if config.whisper_backend == 'mlx-whisper':
+    import mlx.core as mx
+    from mlx_whisper.transcribe import ModelHolder
+
+    repo = _resolve_mlx_model_repo(config.whisper_model)
+    ModelHolder.get_model(repo, mx.float16)
+    print(f'MLX Whisper model ready: {repo}')
+else:
+    from faster_whisper import WhisperModel
+
+    model = WhisperModel(
+        config.whisper_model,
+        device=config.whisper_device,
+        compute_type=config.whisper_compute_type,
+    )
+    print(f'faster-whisper model ready: {config.whisper_model}')
 "
 
 # 6. Install LaunchAgent
