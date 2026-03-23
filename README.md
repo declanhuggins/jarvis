@@ -128,8 +128,8 @@ TTS providers:
 
 OpenClaw notes:
 
-- use the OpenAI-compatible Chat Completions endpoint
-- `gateway.http.endpoints.chatCompletions.enabled` must be enabled
+- use the OpenResponses-compatible `/v1/responses` endpoint
+- `gateway.http.endpoints.responses.enabled` must be enabled
 - keep it on private ingress
 - `openclaw_api_key` can use a 1Password reference like `op://Private/OpenClaw/credential`
 

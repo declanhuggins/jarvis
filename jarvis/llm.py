@@ -115,6 +115,8 @@ class LLMClient:
                 response_text = self._call_anthropic(system_prompt, transcript)
             elif self._provider == "ollama":
                 response_text = self._call_ollama(system_prompt, transcript)
+            elif self._provider == "openclaw":
+                response_text = self._call_openclaw(system_prompt, transcript)
             else:
                 response_text = self._call_openai(system_prompt, transcript)
         except LLMError:
@@ -174,11 +176,6 @@ class LLMClient:
 
     def _build_messages(self, system_prompt: str, user_message: str) -> list[dict[str, str]]:
         """Build chat messages including recent conversation history."""
-        if self._provider == "openclaw":
-            return [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ]
         return [
             {"role": "system", "content": system_prompt},
             *self._history,
@@ -226,6 +223,8 @@ class LLMClient:
             return self._call_anthropic(system_prompt, repair_prompt)
         if self._provider == "ollama":
             return self._call_ollama(system_prompt, repair_prompt)
+        if self._provider == "openclaw":
+            return self._call_openclaw(system_prompt, repair_prompt)
         return self._call_openai(system_prompt, repair_prompt)
 
     def _call_anthropic(self, system_prompt: str, user_message: str) -> str:
@@ -235,15 +234,11 @@ class LLMClient:
                 model=self._model,
                 max_tokens=512,
                 system=system_prompt,
-                messages=(
-                    [{"role": "user", "content": user_message}]
-                    if self._provider == "openclaw"
-                    else [
-                        {"role": message["role"], "content": message["content"]}
-                        for message in self._history
-                    ]
-                    + [{"role": "user", "content": user_message}]
-                ),
+                messages=[
+                    {"role": message["role"], "content": message["content"]}
+                    for message in self._history
+                ]
+                + [{"role": "user", "content": user_message}],
             )
             return response.content[0].text
         except Exception as e:
@@ -283,6 +278,21 @@ class LLMClient:
         except Exception as e:
             raise LLMError(f"{self._provider} API error: {e}") from e
 
+    def _call_openclaw(self, system_prompt: str, user_message: str) -> str:
+        """Call the OpenClaw OpenResponses-compatible API."""
+        try:
+            response = self._client.responses.create(
+                model=self._model,
+                instructions=system_prompt,
+                input=user_message,
+                max_output_tokens=512,
+                extra_headers=self._extra_headers,
+                user=self._session_key,
+            )
+            return _extract_responses_text(response)
+        except Exception as e:
+            raise LLMError(f"{self._provider} API error: {e}") from e
+
 
 def _normalize_openai_base_url(base_url: str) -> str:
     """Ensure OpenAI-compatible base URLs include the /v1 prefix expected by the SDK."""
@@ -290,3 +300,22 @@ def _normalize_openai_base_url(base_url: str) -> str:
     if not normalized.endswith("/v1"):
         normalized = f"{normalized}/v1"
     return normalized
+
+
+def _extract_responses_text(response) -> str:
+    """Extract plain text from an OpenAI/OpenResponses API response object."""
+    output_text = getattr(response, "output_text", None)
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text
+
+    output = getattr(response, "output", None) or []
+    for item in output:
+        if getattr(item, "type", None) != "message":
+            continue
+        for part in getattr(item, "content", None) or []:
+            if getattr(part, "type", None) == "output_text":
+                text = getattr(part, "text", "")
+                if text:
+                    return text
+
+    raise LLMError("OpenClaw Responses API returned no output text")
